@@ -283,6 +283,14 @@ class FoldingReweighter(BaseEstimator, ReweighterMixin):
         To build unbiased predictions for data, pass the **same** dataset (with same order of events)
         as in training to `predict_weights`, in which case
         a reweighter will be used to predict each event that the reweighter didn't use it during training.
+
+        It may be useful to split the data across the folds in a determinstic way that does not rely on
+        the length of the training data (e.g. split by some index number so that the reweighters can be
+        applied on a subset of the original data).
+        This can be achieved by passing 1D arrays of fold indices when using `fit` with the
+        `original_fold_column` and `target_fold_column` and then using the same procedure with the
+        `original_fold_column` argument to `predict_weights`.
+
         To use information from not one, but several reweighters during predictions,
         provide appropriate voting function. Examples of voting function:
         >>> voting = lambda x: numpy.mean(x, axis=0)
@@ -302,6 +310,7 @@ class FoldingReweighter(BaseEstimator, ReweighterMixin):
         self.reweighters = []
         self._random_number = None
         self.train_length = None
+        self.custom_fold_indices = False
 
     def _get_folds_column(self, length):
         """
@@ -313,7 +322,13 @@ class FoldingReweighter(BaseEstimator, ReweighterMixin):
         folds_column = numpy.random.RandomState(self._random_number).permutation(folds_column)
         return folds_column
 
-    def fit(self, original, target, original_weight=None, target_weight=None):
+    def _check_custom_fold_column(self, custom_fold_column, data_length):
+        assert numpy.ndim(custom_fold_column) == 1, 'Custom fold indices (original_fold_column and target_fold_column) should be 1-dimensional'
+        assert len(custom_fold_column) == data_length, f'Custom fold indices (original_fold_column and target_fold_column) should have the same length as the data\nCustom fold column has length {len(custom_fold_column)} whereas data has length {data_length}'
+        assert numpy.all(numpy.isin(custom_fold_column, numpy.arange(self.n_folds))), f'original_fold_column and target_fold_column values must be integers in the range (0, n_folds - 1) = (0, {self.n_folds - 1})'
+        return True
+
+    def fit(self, original, target, original_weight=None, target_weight=None, original_fold_column=None, target_fold_column=None):
         """
         Prepare reweighting formula by training a sequence of trees.
 
@@ -321,13 +336,25 @@ class FoldingReweighter(BaseEstimator, ReweighterMixin):
         :param target: values from target distribution, array-like of shape [n_samples, n_features]
         :param original_weight: weights for samples of original distributions
         :param target_weight: weights for samples of original distributions
+        :param original_fold_column: mapping of which fold to use for each original value (1D array of ints)
+        :param target_fold_column: mapping of which fold to use for each target value (1D array of ints)
         :return: self
         """
         original, original_weight = self._normalize_input(original, original_weight, normalize=False)
         target, target_weight = self._normalize_input(target, target_weight, normalize=False)
 
-        folds_original = self._get_folds_column(len(original))
-        folds_target = self._get_folds_column(len(target))
+        if original_fold_column is None:
+            folds_original = self._get_folds_column(len(original))
+        else:
+            if self._check_custom_fold_column(original_fold_column, len(original)):
+                folds_original = original_fold_column
+
+        if target_fold_column is None:
+            folds_target = self._get_folds_column(len(target))
+        else:
+            if self._check_custom_fold_column(target_fold_column, len(target)):
+                folds_target = target_fold_column
+
         for _ in range(self.n_folds):
             self.reweighters.append(clone(self.base_reweighter))
 
@@ -339,9 +366,10 @@ class FoldingReweighter(BaseEstimator, ReweighterMixin):
                                     original_weight=original_weight[folds_original != i],
                                     target_weight=target_weight[folds_target != i])
         self.train_length = len(original)
+        self.custom_fold_indices = (original_fold_column is not None or target_fold_column is not None)
         return self
 
-    def predict_weights(self, original, original_weight=None, vote_function=None):
+    def predict_weights(self, original, original_weight=None, original_fold_column=None, vote_function=None):
         """
         Returns corrected weights. Result is computed as original_weight * reweighter_multipliers.
 
@@ -369,7 +397,18 @@ class FoldingReweighter(BaseEstimator, ReweighterMixin):
                           '(length of data passed not equal to length of train)')
                 else:
                     print('KFold prediction using folds column')
-            folds_original = self._get_folds_column(len(original))
+
+                if self.custom_fold_indices and original_fold_column is None:
+                    print('A custom mapping between data and fold indices (original_fold_column and/or')
+                    print('target_fold_column) was supplied when training the FoldingReweighter but has')
+                    print('not been supplied when evaluating the weights (original_fold_column option).')
+                    print('This can mean your reweighters may be applied on data which they were trained on!')
+
+            if original_fold_column is None:
+                folds_original = self._get_folds_column(len(original))
+            else:
+                if self._check_custom_fold_column(original_fold_column, len(original)):
+                    folds_original = original_fold_column
             new_original_weight = numpy.zeros(len(original))
             original = numpy.asarray(original)
             for i in range(self.n_folds):
